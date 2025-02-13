@@ -36,7 +36,11 @@
           validate_certs: false
           use_rest:       always
       no_log: true
-
+    
+    - name: Extract VLAN ID
+      set_fact:
+        lif_vlan_id: "{{ (vars_ext.vlan_id | regex_search('-([0-9]+)', '\\1'))[0] }}"
+    
     - name: Get cluster ports
       netapp.ontap.na_ontap_rest_info:
         <<: *auth
@@ -47,14 +51,14 @@
           - node.name
           - name
         parameters:
-          vlan.tag: "{{ vars_ext.vlan_id }}"
+          vlan.tag: "{{ lif_vlan_id | int }}"
       register: cls_net_ports
     
-    - debug:
-        msg: "{{ item.node.name }}"
-      loop: "{{ cls_net_ports.ontap_info.network_ethernet_ports.records }}"
+    # - debug:
+    #     msg: "{{ item.node.name }}"
+    #   loop: "{{ cls_net_ports.ontap_info.network_ethernet_ports.records }}"
 
-    - name: Get SVM interfaces
+    - name: Get SVM LIFs
       netapp.ontap.na_ontap_rest_info:
         <<: *auth
         use_python_keys: yes
@@ -64,11 +68,30 @@
           - location
         parameters:
           svm.name: "{{ vars_ext.input_svm }}"
-          location.home_port: "{{ cls_net_ports.ontap_info.network_ethernet_ports.records[0].name }}"
+          #location.home_port: "{{ cls_net_ports.ontap_info.network_ethernet_ports.records[0].name }}"
+          location.home_port: "*-{{ lif_vlan_id }}"
       register: svm_net_int
 
     - set_fact:
-        aggregate_node: "{{ svm_net_int.ontap_info.network_ip_interfaces.records[0].location.home_node.name }}"
+        node_list: "{{ svm_net_int.ontap_info.network_ip_interfaces.records | map(attribute='location.home_node.name') | join(',') }}"
+    #- debug: var=node_list
+    
+    - name: Get all aggregates
+      netapp.ontap.na_ontap_rest_info:
+        <<: *auth
+        use_python_keys: yes
+        gather_subset:
+          - aggregate_info
+        fields:
+          - name
+          - node.name
+        parameters:
+          node.name: "{{ node_list }}"
+      register: aggr_info
+
+
+    - set_fact:
+        aggregate_list: "{{ aggr_info.ontap_info.storage_aggregates.records | map(attribute='name') | list }}"
         vol_proto: 'n'
         vol_svm_idx: "{{ (vars_ext.input_svm | regex_search('^svm_alexeym_sv[0-9]{2,3}[a-z]{3,3}([0-9]{3,4})$', '\\1'))[0] }}"
     
@@ -92,7 +115,7 @@
               name: "{{ vol_prefix }}*"
           register: existing_vols
         
-        - debug: var=existing_vols.ontap_info.storage_volumes
+       # - debug: var=existing_vols.ontap_info.storage_volumes
         
         - set_fact:
             vol_name: "{{ vol_prefix }}000"
@@ -112,31 +135,70 @@
     # when descriptive naming is used
     - set_fact:
         vol_name: "{{ vol_prefix }}{{ vars_ext.input_postfix_server}}{{ vars_ext.input_postfix_app}}"
+        export_policy: 
+          name: "{{ vars_ext.input_postfix_server[1:] }}"
+          rorule: "any"
+          rwrule: "sys"
+          superuser: "sys"
+          protocol: "nf3"
       when: vars_ext.input_descr_naming | bool
     
     
-    - name: "Find best aggregate {{ vol_name }}" 
-      get_best_aggregate:
+    - name: "Find best aggregate for volume {{ vol_name }}" 
+      get_best_aggregate_selective:
           <<: *auth
-          volume_name              : "{{ vol_name }}"
-          svm_name                 : "{{ vars_ext.input_svm }}"
-          debug                    : True
-          size_mb                  : 5000
-          weight_volume_count      : 0
-          weight_used_pct          : 0
-          weight_provisioned_pct   : 0
-          weight_available_space   : 1
-          include_node_regex         : "{{ aggregate_node }}"
+          svm_name:                "{{ vars_ext.input_svm }}"
+          debug:                   True
+          size_mb:                 5000
+          weight_volume_count:     0
+          weight_used_pct:         0
+          weight_provisioned_pct:  0
+          weight_available_space:  1
+          aggr_names_list:         "{{ aggregate_list }}"
       register: aggr_lookup
     
-    - debug:
-        msg: "{{ item.location.home_node.name }}"
-      loop: "{{ svm_net_int.ontap_info.network_ip_interfaces.records }}"
-    
+    # - debug:
+    #     msg: "{{ item.location.home_node.name }}"
+    #   loop: "{{ svm_net_int.ontap_info.network_ip_interfaces.records }}"   
+
     - name: Generated names and findings
       debug:
         msg: 
-          - "Suitable node:      {{ aggregate_node }}"
-          - "Suitable aggregate: {{ aggr_lookup.aggregate.name }}"
-          - "New volume name:    {{ vol_name }}"
+          - "Searched on nodes:     {{ node_list }}"
+          - "Searched in aggr list: {{ aggregate_list | join(', ') }}"
+          - "Suitable aggregate:    {{ aggr_lookup.aggregate.name }}"
+          - "New volume name:       {{ vol_name }}"
+          - "Export policy:         {{ export_policy }}"
+    
+    - name: Checking if volume "{{ vol_name }}" exists
+      netapp.ontap.na_ontap_rest_info:
+        <<: *auth
+        use_python_keys: yes
+        gather_subset:
+          - volume_info
+        parameters:
+          name: "{{ vol_name }}"
+      register: vol_exists_info
+
+    - assert:
+        that:
+          - vol_exists_info.ontap_info.storage_volumes.num_records == 0
+        fail_msg: "Volume {{ vol_name }} already exists. Exiting. Please check the name"
+        success_msg: "Volume {{ vol_name }} does not exist - continue for create"
+
+    - name: Create volume
+      netapp.ontap.na_ontap_volume:
+        <<: *auth
+        name:                  "{{ vol_name }}"
+        vserver:               "{{ vars_ext.input_svm }}"
+        aggregate_name:        "{{ aggr_lookup.aggregate.name }}"
+        language:              C.UTF-8
+        size:                  5
+        state:                 present
+        junction_path:         /{{ vol_name }}
+        volume_security_style: unix
+        snapshot_policy:       default
+        space_guarantee:       none
+        wait_for_completion:   yes
+      when: vars_ext.vol_create | bool
           
